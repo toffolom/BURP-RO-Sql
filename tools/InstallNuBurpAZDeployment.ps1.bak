@@ -1,0 +1,638 @@
+
+param (
+	[int]$hubport = 7777,
+	[string]$hubhost="burprouter.southcentralus.cloudapp.azure.com",
+	[string]$hubdb = "HUB",
+	[string]$hubadmuser = "hubAdmin",
+	[string]$hubadmpswd,
+	[string]$tmplthost = "smeltania",
+	[string]$dfltTenantGrp = "TenantsRSG",
+	[string]$dfltburpadm = "burpAdmin",
+	[string]$dfltlocation = "south central us",
+	[string]$dfltsqlver = "12.0",
+	[string]$dflthubvm = "RouterVM",
+	[string]$dflthubrsg = "CoreRSG",
+	[string]$dfltadmsess = "00000000-0000-0000-0000-00000000000",
+	[string]$dfltinitproc = "tools.SetupDeployment",
+	[string]$dflthubsproc = "di.SetupAzSqlDeployment",
+	[int]$dfltazsqlport = 1433,
+	[string]$dfltipuriinfo = "https://api.ipify.org/",
+	$dfltazdbnm = "BHP1-RO",
+	$dflthubdbnm = "HUB"
+)
+
+#Set-Location -Path c:\temp
+
+Import-Module -Name SQLServer
+Import-Module -Name AZ.Accounts
+import-module -name AZ.Sql
+#import-module -name AZ.Service
+
+#. (Join-Path $PSScriptRoot 'SetupNewDeploy.designer.ps1')
+
+
+$scriptName = $MyInvocation.MyCommand.Name.split('.')[0];
+
+Function Get-PublicIP {
+	$info = Invoke-WebRequest -uri $dfltipuriinfo
+	if ($info.StatusCode -eq 200){
+		return [ipaddress]$info.Content;
+	}
+	return [ipaddress]"127.0.0.1";
+}
+
+Function Get-YesNoAns ([string]$Title, [string]$Question, [bool]$DfltIsYes)
+{
+	[int]$dflt = !${DfltIsYes}
+
+	$yes = New-Object System.Management.Automation.Host.ChoiceDescription "&Yes", `
+    	"yes, perform requested action!!!"
+
+	$no = New-Object System.Management.Automation.Host.ChoiceDescription "&No", `
+    	"no, abort...do nothing!!!"
+
+	$options = [System.Management.Automation.Host.ChoiceDescription[]]($yes, $no)
+
+	$result = $host.ui.PromptForChoice($title, $question, $options, $dflt)
+
+	switch ($result)
+    	{
+        	0 { $true }
+        	default { $false }
+    	}
+}
+
+Function Get-Ans ([string]$Question, [string]$Dflt)
+{
+	if (![string]::IsNullOrWhiteSpace($Dflt))
+	{
+		$val = Read-Host -Prompt "${Question} [default->'${Dflt}'] "
+		if ([string]::isNullOrWhiteSpace($val))
+		{
+			$Dflt
+		}
+		else
+		{
+			$val
+		}
+	}
+	else
+	{
+		$val = Read-Host -Prompt "${Question}"
+		$val
+	}
+}
+
+Function Chk-AzSqlNameUniq ([string]$name)
+{
+	$found = $sqlsrvrlst | ? { $_.servername -ieq $name }
+	return (-not($found)); # -ne $null) { return $false }
+	#return $true
+}
+
+function IsValidEmail { 
+    param([string]$EmailAddress)
+
+    try {
+        $null = [mailaddress]$EmailAddress;
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function CleanDataSource
+{
+	param([Parameter(Mandatory)]
+		[String]$Datasource
+	)
+
+	$ds = $Datasource.ToLower().Replace('tcp:',"").replace("(","").replace(")","")
+
+	if ($ds.Split(',').Length -eq 1)
+	{
+		return "{0},{1}" -f $ds,$dfltazsqlport
+	}
+	else
+	{
+		return $ds
+	}
+}
+
+function Run-SqlStmt {
+    param($ServerName, $DbNm, $User, $Password, $Stmt );
+	
+	#$ErrorActionPreference = 'Stop';
+	$dset = New-Object System.Data.DataSet;
+	
+	try {
+		$Ds = CleanDataSource -Datasource $ServerName
+		$conn = new-object System.Data.SqlClient.SqlConnection
+		$cstr = 'Connection Timeout=10;Application Name=new deployment setup;Data Source=tcp:{0};Initial Catalog={1};User ID={2};Password={3}' -f $Ds,$DbNm,$User,$Password
+		$conn.ConnectionString = $cstr;
+		## Attach the InfoMessage Event Handler to the connection to write out the messages
+		$handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
+			param($sender, $event) 
+			echo "Sql Message ->{0}" -f $event.Message;
+		};
+		$conn.add_InfoMessage($handler);
+		$conn.FireInfoMessageEventOnUserErrors = $true;
+		
+		$cmd = $conn.CreateCommand();
+		$cmd.CommandTimeout = 10
+		$cmd.Connection = $conn
+		$cmd.CommandText= $Stmt
+		$cmd.CommandType = [System.Data.CommandType]::Text;
+		
+		$conn.Open()
+
+		echo "Executing SQL => ${Stmt}..."
+		$adp = New-Object System.Data.SqlClient.SqlDataAdapter $cmd;
+		$adp.Fill($dset) # | format-table;
+		#$data.Tables[0] | Format-Table
+	} catch {
+		echo "An error occurred:" 
+		echo $_.Exception.Message
+		echo $_.ScriptStackTrace
+    } finally {
+        $conn.Close();
+    }
+	return $dset;
+}
+
+function Initialize-Clone {
+	param(
+		$Servername = $NuFQN,
+		$DbNm = $dfltazdbnm,
+		$User = $NuSqlAdmID,
+		$Password = $NuSqlAdmPswd,
+		[guid]$GUID = $NuGuid,
+		$DeployName = $NuBizName,
+		$PrimaryContact = $NuBizPerson,
+		$Ph = $NuBizPh,
+		$SysAdmEmail = $NuAdmEmail,
+		$UsrAdmEmail = $NuUsrEmail,
+		$UsrAlias = $NuUsrAlias,
+		$UsrAdmPswd = $NuUsrPswd,
+		$Stmt = $dfltinitproc,
+		[string]$Description = $NuBizDescr
+	)
+
+	[bool]$ok = $true;
+
+	try {
+		$Ds = CleanDataSource -Datasource $ServerName
+		$cstr = 'Connection Timeout=10;Application Name=(pwsh - {4});Data Source=tcp:{0};Initial Catalog={1};User ID={2};Password={3}' -f $Ds,$DbNm,$User,$Password,$scriptName;
+		$conn = new-object System.Data.SqlClient.SqlConnection $cstr;
+		#echo "${cstr}";
+		## Attach the InfoMessage Event Handler to the connection to write out the messages
+		$handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
+			param($sender, $event) 
+			echo "Sql Message ->{0}" -f $event.Message;
+		};
+		$conn.add_InfoMessage($handler);
+		$conn.FireInfoMessageEventOnUserErrors = $true;
+		
+		$cmd = $conn.CreateCommand();
+		$cmd.Connection = $conn
+		$cmd.CommandText= $Stmt
+		$cmd.CommandType = [System.Data.CommandType]::StoredProcedure;
+
+		
+		$conn.Open()
+
+		Echo "Opening connection now..."
+
+		if ($UsrAlias -eq $null) { $UsrAlias = $UsrAdmEmail.split('@')[0]; }
+		Echo "Alias -> ${UsrAlias}";
+
+		$cmd.Parameters.Add("@SessID", [System.Data.SqlDbType]::VarChar, 256).Value = "00000000-0000-0000-0000-000000000000";
+		echo "param @sessid set."
+		$cmd.Parameters.Add("@DeployGUID", [System.Data.SqlDbType]::Varchar, 256).Value = $GUID.guid;
+		echo "param @guid set -> $GUID.guid..."
+		$cmd.Parameters.Add("@SysAdminEmail", [System.Data.SqlDbType]::VarChar, 200).Value = $SysAdmEmail;
+		echo "param @sysemail set -> ${SysAdmEmail}..."
+		$cmd.Parameters.Add("@UsrAdminEmail", [System.Data.SqlDbType]::VarChar, 200).Value = $UsrAdmEmail;
+		echo "param @usremail set -> ${UsrAdmEmail}..."
+		$cmd.Parameters.Add("@UsrLoginPswd", [System.Data.SqlDbType]::Varchar, 50).Value = $UsrAdmPswd;
+		echo "param @usrpwd set -> ${UsrAdmPswd}..."
+		$cmd.Parameters.Add("@UsrAlias", [System.Data.SqlDbType]::Varchar, 200).Value = $UsrAlias;
+		echo "param @alias set -> ${UsrAlias}..."
+		$cmd.Parameters.Add("@BusinessName", [System.Data.SqlDbType]::Varchar, 200).Value = $DeployName;
+		echo "param @name set -> ${DeployName}...";
+		$cmd.Parameters.Add("@Descr", [System.Data.SqlDbType]::Varchar, 4000).Value = $Description;
+		echo "param @descr set -> ${Description}...";
+		$cmd.Parameters.Add("@PrimaryContactName", [System.Data.SqlDbType]::Varchar, 200).Value = $PrimaryContact;
+		echo "param @contact set -> ${PrimaryCOntact}...";
+		$cmd.Parameters.Add("@PrimaryPh", [System.Data.SqlDbType]::Varchar, 50).Value = $Ph;
+		echo "param @ph set -> ${Ph}...";
+
+		echo "Executing SQL => ${Stmt}..."
+		$rows = $cmd.ExecuteNonQuery();
+		echo "[${rows}] affected...";
+
+	} catch {
+		echo "An error occurred:" 
+		echo $_.Exception.Message
+		echo $_.ScriptStackTrace
+		$ok = $false;
+    } finally {
+        if ($conn -and $conn.State -eq [System.Data.ConnectionState]::Open) { $conn.Close(); }
+		if ($ok) { echo "clone initialization complete!!!"; }
+    }
+	return $ok;
+}
+
+function DoHub-Setup {
+	param(
+		$HubSqlSrvr = $hubhost,
+		$HubSqlPort = $hubport,
+		$HubSqlUser = $hubadmuser,
+		$HubSqlPswd = $hubadmpswd,
+		$HubDbNm = $dflthubdbnm, 
+		$AZAdminID = $NuSqlAdmID,
+		$AZAdminPswd = $NuSqlAdmPswd,
+		[guid]$GUID = $NuGuid,
+		$DeployName = $NuBizName,
+		$PrimaryContact = $NuBizPerson,
+		$Ph = $NuBizPh,
+		$AZAdminEmail = $NuAdmEmail,
+		$UsrAdmEmail = $NuUsrEmail,
+		$UsrAlias = $NuUsrAlias,
+		$UsrAdmPswd = $NuUsrPswd,
+		$Stmt = $dflthubsproc,
+		[string]$Description = $NuBizDescr,
+		[bool]$doTest = $false,
+		$AZSqlSrvrName = $NuAzSqlSrvr,
+		$AZFqnHostname = $NuFQN,
+		$AZDbNm = $dfltazdbnm,
+		$TestLink = $true
+	)
+
+	[bool]$ok = $true;
+
+	try {
+		$Ds = "{0},{1}" -f $HubSqlSrvr, $HubSqlPort;
+		$cstr = 'Connection Timeout=10;Application Name=(pwsh - {4});Data Source=tcp:{0};Initial Catalog={1};User ID={2};Password={3}' -f $Ds,$HubDbNm,$HubSqlUser,$HubSqlPswd,$scriptName;
+		$conn = new-object System.Data.SqlClient.SqlConnection $cstr
+		#echo $cstr;
+		## Attach the InfoMessage Event Handler to the connection to write out the messages
+		$handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
+			param($sender, $event) 
+			echo "Sql Message -> ${evnt}.Message"
+		};
+		$conn.add_InfoMessage($handler);
+		$conn.FireInfoMessageEventOnUserErrors = $true;
+		
+		$cmd = $conn.CreateCommand();
+		$cmd.Connection = $conn
+		$cmd.CommandText= $Stmt
+		$cmd.CommandType = [System.Data.CommandType]::StoredProcedure;
+		
+		$conn.Open()
+
+		Echo "Opening connection now..."
+
+		if ($UsrAlias -eq $null) { $UsrAlias = $UsrAdmEmail.split('@')[0]; }
+
+		$cmd.Parameters.Add("@SessID", [System.Data.SqlDbType]::VarChar, 256).Value = "00000000-0000-0000-0000-000000000000";
+		$cmd.Parameters.Add("@DeployGUID", [System.Data.SqlDbType]::Varchar, 256).Value = $GUID.guid;
+		$cmd.Parameters.Add("@BusinessName", [System.Data.SqlDbType]::Varchar, 200).Value = $DeployName;
+		$cmd.Parameters.Add("@Descr", [System.Data.SqlDbType]::Varchar, 4000).Value = $Description;
+		$cmd.Parameters.Add("@SysAdminID", [System.Data.SqlDbType]::NVarChar, 128).Value = $AZAdminID;
+		$cmd.Parameters.Add("@SysAdminEmail", [System.Data.SqlDbType]::VarChar, 200).Value = $AZAdminEmail;
+		$cmd.Parameters.Add("@SysAdminPswd", [System.Data.SqlDbType]::VarChar, 50).Value = $AZAdminPswd;
+		$cmd.Parameters.Add("@UsrAdminEmail", [System.Data.SqlDbType]::VarChar, 200).Value = $UsrAdmEmail;
+		$cmd.Parameters.Add("@UsrAdminPswd", [System.Data.SqlDbType]::Varchar, 50).Value = $UsrAdmPswd;
+		$cmd.Parameters.Add("@UsrAlias", [System.Data.SqlDbType]::Varchar, 200).Value = $UsrAlias;
+		$cmd.Parameters.Add("@AZSqlHostName", [System.Data.SqlDbType]::NVarChar, 128).Value = $AZSqlSrvrName;
+		$cmd.Parameters.Add("@FQNHostName", [System.Data.SqlDbType]::Varchar, 200).Value = $AZFqnHostname;
+		$cmd.Parameters.Add("@PrimaryContactName", [System.Data.SqlDbType]::Varchar, 200).Value = $PrimaryContact;
+		$cmd.Parameters.Add("@PrimaryPh", [System.Data.SqlDbType]::Varchar, 50).Value = $Ph;
+		$cmd.Parameters.Add("@DeployDbNm", [System.Data.SqlDbType]::NVarChar, 128).Value = $AZDbNm
+		$cmd.Parameters.Add("@TestLink", [System.Data.SqlDbType]::Bit).Value = $TestLink;
+
+		echo "Executing SQL => ${Stmt}..."
+		$rows = $cmd.ExecuteNonQuery();
+		echo "[${rows}] affected...";
+
+	} catch {
+		echo "An error occurred:" 
+		echo $_.Exception.Message
+		echo $_.ScriptStackTrace
+		$ok = $false;
+    } finally {
+        if ($conn -and $conn.State -eq [System.Data.ConnectionState]::Open) { $conn.Close(); }
+		if ($ok) { echo "HUB setup complete!!!"; }
+    }
+	return $ok;
+}
+
+function Test-SqlConnection {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ServerName,
+        [Parameter(Mandatory)]
+        [string]$DbNm,
+        [Parameter(Mandatory)]
+        [string]$User,
+        [Parameter(Mandatory)]
+        [string]$Password
+    )
+
+    $ErrorActionPreference = 'Stop'
+
+    try {
+		$Ds = CleanDataSource -Datasource $ServerName
+        $cstr = 'Connection Timeout=3;Application Name=test conn;Data Source=tcp:{0};Initial Catalog={1};User ID={2};Password={3}' -f $Ds,$DbNm,$User,$Password
+        $conn = New-Object System.Data.SqlClient.SqlConnection $cstr;
+        $conn.Open()
+        ## This will run if the Open() method does not throw an exception
+        return $true
+    } catch {
+        return $false
+    } finally {
+        ## Close the connection when we're done
+        try { $conn.Close(); } catch {}
+    }
+}
+
+#Add-Type -AssemblyName "Microsoft.SqlServer.Smo,Version=11.0.0.0,Culture=neutral,PublicKeyToken=89845dcd8080cc91"
+#Add-Type -AssemblyName SqlServer
+
+$AZCtx = Get-AZContext;
+
+If ($AZCtx -eq $null){
+
+	$AZCreds = connect-azaccount
+
+	if ($AZCreds -ne $null) 
+	{
+		Echo "Thank you...";
+	}
+	else { 
+		Echo "Goodbye...login failed!!!";
+		exit; 
+	}
+}
+else
+{
+	Echo "Logged into subscription..."
+	$AZCtx | Format-Table
+}
+
+do {
+	$TenantRSG = Get-Ans "Enter the Burp Tenant resource group name..." $dfltTenantGrp
+	$tmprsg = Get-AzResourceGroup | ? {$_.ResourceGroupName -ieq $TenantRSG}
+	if (-not($tmprsg)) { # -eq $null){
+		$ans = Get-YesNoAns "Not Found..." "ResourceGroup:[${TenantRSG}] does NOT exist...try again?" $true
+		if ($ans -eq $false){ 
+			echo "goodbye..."
+			exit; 
+		}
+	}
+} While (-not($tmprsg)); # -eq $null)
+
+
+$vmstats = (get-azvm -resourcegroupname $dflthubrsg -name $dflthubvm -status).Statuses
+$vmpwrstatus = $vmstats[1].DisplayStatus;
+
+if ($vmpwrstatus -ilike "*deallocated") {
+	echo "VM:[${dflthubvm}] is NOT running..."
+	echo "To proceed vm must be started..."
+	$dostart = Get-YesNoAns "Start VM" "Do you want to start vm:[${dflthubvm}] now?" $true
+	if (-not($dostart)) { # -eq $false){
+		echo "goodbye...cannot proceed!!!"
+		exit
+	}
+	Start-azvm -name $dflthubvm -resourcegroupname $dflthubrsg
+
+}
+
+Get-Ans "VM:[${dflthubvm}] running...let's test sql connectivity now...press <enter> to continue"
+
+if ([string]::IsNullOrWhiteSpace($hubadmpswd)) {
+	do {
+		$hubadmpswd = Read-Host -Prompt "Enter Sql Admin('${hubadmuser}') password...";
+		if ([string]::IsNullOrWhiteSpace($hubadmpswd))
+		{
+			$stop = Get-YesNoAns "Entry required!!!" "Password required...do you want to quit!?" $true
+			if ($stop) {
+				echo "Goodbye...";
+				Exit;
+			}
+		}
+		else { break; }
+	} while ($true);
+}
+
+do {
+	$xx = "{0},{1}" -f $hubhost,$hubport;
+	echo "attempting to connect to:[${xx}] now...";
+	$ok = Test-SqlConnection -ServerName $xx -DbNm $dflthubdbnm  -User $hubadmuser -Password $hubadmpswd;
+	if (-not($ok))
+	{
+		$donu = Get-YesNoAns "Test Failed!!" "Failed to connect...try another password?" $true;
+		if (-not($donu)){
+			echo "Goodbye!!!"
+			Exit;
+		}
+		$hubadmpswd = Read-Host -Prompt "Enter Sql Admin(${hubadmuser}) password...";
+	}
+	else{ echo "Test successful!!!"; }
+	
+} while (-not($ok));
+
+$sqlsrvrlst = get-azsqlserver -resourcegroupname $TenantRSG
+
+echo "Current sql server(s)..."
+$sqlsrvrlst | Format-Table -property Servername,location,FullyQualifiedDomainname,Sqladministratorlogin,serverversion
+echo "";
+
+$NuSqlAdmID = Get-Ans "Enter new sqlserver (sa) admin login name" $dfltburpadm
+$NuSqlAdmPswd = Get-Ans "Enter sqlserver (sa) admin password."
+$NuLocation = Get-Ans "Enter region to host instance." "$dfltlocation"
+[guid]$NuGuid = New-GUID;
+$AdmPWord = ConvertTo-SecureString -String $NuSqlAdmPswd -AsPlainText -Force
+$NuAdmCreds = New-Object -TypeName System.Management.Automation.PSCredential `
+	-ArgumentList $NuSqlAdmID, $AdmPWord;
+
+do {
+	$NuAzSqlSrvr = Get-Ans "Enter new sql server instance name."
+	$ok = Chk-AzSqlNameUniq $NuAzSqlSrvr
+	if ($ok -eq $false){
+		echo "Server in use...";
+		get-azsqlserver -name $NuAzSqlSrvr | Format-Table -property Servername,location,FullyQualifiedDomainname,Sqladministratorlogin,serverversion
+		$doRm = Get-YesNoAns "Remove Service" "Would you like to remove server:[${NuAzSqlSrvr}]" $false
+		if ($doRm -eq $true){
+			Remove-azsqlserver -ResourceGroupName "$TenantRSG" -Name "$NuAzSqlSrvr" -cf | Out-Null
+			echo "refreshing sqlserver list..."
+			$sqlsrvrlst = get-azsqlserver -resourcegroupname $TenantRSG
+			break
+		}
+		else {
+			$quit = Get-YesNoAns "Pick another..." "choose another name...wanna quit?" $true
+			if ($quit -eq $true){ 
+				echo "goodbye..."
+				exit; 
+			}
+			Sleep -seconds 1.5
+		}
+	}
+	
+} while (-not($ok)); # -eq $false);
+
+echo "New AZ Sql name is:[${NuAzSqlSrvr}]...";
+
+do {
+	$NuAdmEmail = Get-Ans "Enter deployment administrators email..." "${NuAzSqlSrvr}_admin@burp.biz"
+	$ok = IsValidEmail $NuAdmEmail;
+	if ($ok) { break }
+	echo "invalid email syntax...try again!!";
+	echo "NOTE: email address is not tested with any type of 'test' email...just need syntax to be correct!!!"
+} while (-not($ok));
+
+$NuBizName = Get-Ans "Enter the business name of this deployment...eg: 'some brewery company'" "$NuAzSqlSrvr Brewing Company."
+$NuBizPerson = Get-Ans "Enter Primary contact person at deployment..."
+$NuBizPh = Get-Ans "Enter primary contact phone (if known)..." "(000)000-0000"
+$NuBizDescr = Get-Ans "Pls enter a breif description of customer..."
+if ($NuBizDescr -eq $null) { $NuBizDescr = "no comments given..."; }
+
+do {
+	$NuUsrEmail = Get-Ans "Enter the deployment (admin) user email to log into new deployment?"
+	$ok = IsValidEmail $NuUsrEmail;
+	if ($ok) { break }
+	echo "invalid email syntax...try again!!";
+} while (-not($ok));
+
+$NuUsrAlias = Get-Ans "Enter an alias login for user:[${NuUsrEmail}] if you'd like..." $NuUsrEmail.split('@')[0]
+
+do {
+	$NuUsrPswd = Get-Ans "Enter password for user:[${NuUsrEmail}]..."
+	if ($NuUsrPswd -eq $null) {
+		$ans = Get-Ans "Enter a password...wanna quit...press enter"
+		if ($ans -eq $null){
+			echo "goodbye..."
+			exit;
+		}
+	}
+} while (-not($NuUsrPswd)); # -eq $null)
+
+
+
+$proceed = Get-YesNoAns "Proceed!!??" "Okay to proceed...1st we'll create the sqlserver host..." $true;
+if (-not($proceed)){
+	echo "Aborting...goodbye!!!";
+	exit;
+}
+
+
+$NuSqlSrvrRslts = New-AzSqlServer -ResourceGroupName "${TenantRSG}" `
+	-Location $NuLocation `
+	-ServerName "$NuAzSqlSrvr" `
+	-ServerVersion $dfltsqlver `
+	-SqlAdministratorCredentials $NuAdmCreds `
+	-PublicNetworkAccess Enabled;
+
+If ($NuSqlSrvrRslts -eq $null){
+	echo "Something happend!!!...aborting!!!"
+	Exit;
+}
+
+New-AzSqlServerFirewallRule -ResourceGroupName $TenantRSG -ServerName $NuAzSqlSrvr -AllowAllAzureIPs;
+echo "Access granted to all azure ip's..."
+[ipaddress]$MyIP = Get-PublicIP
+$doit = Get-YesNoAns "Create Rule..." "Okay to add my public ip:[${MyIP}] to firewall rule(s)?" $true
+if ($doit -eq $true) {
+	$fwallnm = Get-Ans "Enter firewall rule name." "mike's local access"
+	New-AzSqlServerFirewallRule `
+		-ResourceGroupName $TenantRSG `
+		-ServerName $NuAzSqlSrvr `
+		-FirewallRuleName "$fwallnm" `
+		-StartIPAddress "${MyIP}" -EndIPAddress "${MyIP}";
+}
+
+echo "new sql server list..."
+$sqlsrvrlst = get-azsqlserver -resourcegroupname $TenantRSG
+$sqlsrvrlst | Format-Table -property Servername,location,FullyQualifiedDomainname,Sqladministratorlogin,serverversion
+
+$NuFQN = $sqlsrvrlst | ? { $_.servername -ieq $NuAzSqlSrvr } | % {$_.FullyQualifiedDomainName}
+
+$ok = Get-YesNoAns "Use Template..." "Okay to use template server:[${tmplthost}]?" $true
+if (-not($ok)) 
+{
+	do {
+		$tmplthost = Get-Ans "Enter template sqlserver hostname..."
+		if ($tmplthost -eq $null)
+		{
+			$ans = Get-Ans "Enter a template hostname...wanna quit...press enter"
+			if ($ans -eq $null){
+				echo "goodbye..."
+				exit;
+			}
+		}
+	} While ($tmplthost -eq $null)
+}
+
+Echo "creating dbms:[${dfltazdbnm}] on host:[${NuFQN}] from template server:[${tmplthost}] now...";
+New-AzSqlDatabaseCopy -ResourceGroupName "$TenantRSG" `
+    -ServerName "${tmplthost}" `
+    -DatabaseName $dfltazdbnm `
+    -CopyResourceGroupName "$TenantRSG" `
+    -CopyServerName "$NuAzSqlSrvr" `
+    -CopyDatabaseName $dfltazdbnm;
+
+do {
+	$dotst = Get-YesNoAns "Test Connectivity..." "Okay to test connectivity to new host:[${NuFQN}] now?" $true
+	if ($dotst -eq $true)
+	{
+		$good = Test-SqlConnection -Servername $NuFQN -dbnm $dfltazdbnm -user $NuSqlAdmID -password $NuSqlAdmPswd
+		if (-not($good)){
+			echo "sql connectivity test failed..."
+			$doit = Get-YesNoAns "Add IP..." "try adding my public ip:[${MyIP}] to firewall rule(s)?" $true
+			if ($doit -eq $true){
+				$fwallnm = Get-Ans "Enter firewall rule name." "mike's local access"
+				New-AzSqlServerFirewallRule `
+					-ResourceGroupName $TenantRSG `
+					-ServerName $NuAzSqlSrvr `
+					-FirewallRuleName "$fwallnm" `
+					-StartIPAddress "$MyIP" -EndIPAddress "$MyIP"
+			}
+			else
+			{
+				$quit = Get-YesNoAns "Quit..." "wanna quit then?" $false
+				if ($quit) { break;}
+			}
+		}
+		else
+		{
+			echo "Success!!!";
+			break;
+		}
+	}
+	else { break; }
+} while ($true);
+
+
+$proceed = Get-YesNoAns "Proceed!!??" "Okay to initialize the new deployment:[${NuBizName}]!?" $true;
+if (-not($proceed))
+{
+	echo "Aborting...goodbye!!!";
+	exit;
+}
+
+Initialize-Clone
+
+$go = Get-YesNoAns "Continue..." "Okay to record new deployment:[${NuBizName}] on HUB now?" $true;
+if ($go -eq $true){
+	DoHub-Setup;
+}
+
+
+
+echo "done";
+
+
+
+#$SetupNewDeploy.ShowDialog()
